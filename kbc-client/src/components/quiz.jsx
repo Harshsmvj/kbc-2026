@@ -9,8 +9,8 @@ function Quiz({
   initialSync = null,
 }) {
   const [sync, setSync] = useState(initialSync);
-  const [selected, setSelected] = useState(null);
-  const [locked, setLocked] = useState(false);
+  const [selected, setSelected] = useState(initialSync?.playerAnswer ?? null);
+  const [locked, setLocked] = useState(initialSync?.playerAnswer !== undefined);
   const [timeLeft, setTimeLeft] = useState(15);
   const [leaderboard, setLeaderboard] = useState([]);
   const [endedEarly, setEndedEarly] = useState(false);
@@ -21,8 +21,13 @@ function Quiz({
       setSync(data);
 
       if (data.phase === "question") {
-        setSelected(null);
-        setLocked(false);
+        if (data.playerAnswer !== undefined) {
+          setSelected(data.playerAnswer);
+          setLocked(true);
+        } else {
+          setSelected(null);
+          setLocked(false);
+        }
       }
     };
 
@@ -58,6 +63,10 @@ function Quiz({
   useEffect(() => {
     if (!sync && initialSync) {
       setSync(initialSync);
+      if (initialSync.playerAnswer !== undefined) {
+        setSelected(initialSync.playerAnswer);
+        setLocked(true);
+      }
     }
   }, [initialSync, sync]);
 

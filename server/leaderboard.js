@@ -1,6 +1,7 @@
 const mongoose = require("mongoose");
 
-const leaderboardSchema = new mongoose.Schema({
+const leaderboardSchema = new mongoose.Schema(
+  {
   roomCode: String,
   playedAt: {
     type: Date,
@@ -13,6 +14,10 @@ const leaderboardSchema = new mongoose.Schema({
     },
   ],
   totalQuestions: Number,
-});
+  },
+  { collection: "quiz_leaderboards" }
+);
 
-module.exports = mongoose.model("Leaderboard", leaderboardSchema);
+leaderboardSchema.index({ roomCode: 1, playedAt: -1 });
+
+module.exports = mongoose.models.Leaderboard || mongoose.model("Leaderboard", leaderboardSchema);

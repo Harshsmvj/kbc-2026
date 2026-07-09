@@ -1,20 +1,25 @@
-require("./db");
+const mongoose = require("./db");
 const Leaderboard = require("./leaderboard");
+const QuizParticipant = require("./participant");
+const QuestionHistory = require("./question-history");
 const defaultQuestions = require("./question");
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
 
-const ADMIN_PASSWORD = "kbc_admin_123";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "kbc_admin_123";
 const DEFAULT_QUESTION_TIME = 15;
 const REVEAL_TIME = 3;
+const PLAYER_REJOIN_GRACE_MS =
+  Number.parseInt(process.env.PLAYER_REJOIN_GRACE_MS, 10) || 10 * 60 * 1000;
 const PORT = Number.parseInt(process.env.PORT, 10) || 5000;
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:3000";
 
 const roomStatus = {};
 const roomPlayers = {};
 const roomTimers = {};
+const playerRemovalTimers = {};
 let activeQuizRoomCode = null;
 
 const app = express();
@@ -25,20 +30,109 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: CLIENT_ORIGIN,
+    origin: true,
     methods: ["GET", "POST"],
   },
 });
 
 const cloneQuestions = (questions) =>
   questions.map((q) => ({
+    _id: q._id ? String(q._id) : undefined,
     question: q.question,
     options: [...q.options],
     correct: q.correct,
+    addedAt: q.addedAt,
   }));
 
 const sanitizeQuestions = (questions) =>
   questions.map(({ question, options }) => ({ question, options }));
+
+const getClientIp = (socket) => {
+  const forwardedFor = socket.handshake.headers["x-forwarded-for"];
+  if (typeof forwardedFor === "string" && forwardedFor.trim()) {
+    return forwardedFor.split(",")[0].trim();
+  }
+
+  return socket.handshake.address || socket.conn?.remoteAddress || "unknown";
+};
+
+const saveParticipant = async ({ roomCode, playerToken, name, socket, isHostPlayer = false }) => {
+  try {
+    const savedParticipant = await QuizParticipant.findOneAndUpdate(
+      { roomCode, playerToken },
+      {
+        $set: {
+          name,
+          ipAddress: getClientIp(socket),
+          userAgent: socket.handshake.headers["user-agent"] || "",
+          lastSeenAt: new Date(),
+          connected: true,
+          isHostPlayer,
+        },
+        $setOnInsert: {
+          joinedAt: new Date(),
+        },
+        $inc: {
+          joinCount: 1,
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    if (savedParticipant) {
+      io.emit("admin-db-updated");
+    }
+  } catch (err) {
+    console.warn("Participant save skipped (offline mode):", err.message);
+  }
+};
+
+const markParticipantDisconnected = async ({ roomCode, playerToken }) => {
+  try {
+    const updatedParticipant = await QuizParticipant.findOneAndUpdate(
+      { roomCode, playerToken },
+      {
+        $set: {
+          connected: false,
+          lastSeenAt: new Date(),
+        },
+      }
+    );
+
+    if (updatedParticipant) {
+      io.emit("admin-db-updated");
+    }
+  } catch (err) {
+    console.warn("Participant disconnect save skipped (offline mode):", err.message);
+  }
+};
+
+const saveQuestionHistory = async ({ roomCode, question, socket }) => {
+  try {
+    const savedQuestion = await QuestionHistory.create({
+      roomCode,
+      question: question.question.trim(),
+      options: question.options.map((opt) => opt.trim()),
+      correct: question.correct,
+      addedBySocketId: socket.id,
+    });
+
+    io.emit("admin-db-updated");
+    return savedQuestion;
+  } catch (err) {
+    console.warn("Question history save skipped (offline mode):", err.message);
+    return null;
+  }
+};
+
+const loadPersistedQuestions = async () => {
+  try {
+    return await QuestionHistory.find({}).sort({ addedAt: 1 });
+  } catch (err) {
+    console.warn("Question history load skipped (offline mode):", err.message);
+    return [];
+  }
+};
 
 const normalizeRoomCode = (roomCode) => String(roomCode).trim();
 
@@ -47,15 +141,49 @@ const isValidRoomCode = (roomCode) => /^\d{6}$/.test(normalizeRoomCode(roomCode)
 const isHost = (socket, roomCode) =>
   roomStatus[normalizeRoomCode(roomCode)]?.hostSocketId === socket.id;
 
+const clearPlayerRemovalTimer = (roomCode, playerId) => {
+  if (playerRemovalTimers[roomCode]?.[playerId]) {
+    clearTimeout(playerRemovalTimers[roomCode][playerId]);
+    delete playerRemovalTimers[roomCode][playerId];
+  }
+};
+
+const schedulePlayerRemoval = (roomCode, playerId) => {
+  if (!playerRemovalTimers[roomCode]) {
+    playerRemovalTimers[roomCode] = {};
+  }
+
+  clearPlayerRemovalTimer(roomCode, playerId);
+
+  playerRemovalTimers[roomCode][playerId] = setTimeout(() => {
+    const players = roomPlayers[roomCode];
+    if (!players?.[playerId]?.connected) {
+      delete players[playerId];
+      emitPlayersList(roomCode);
+    }
+    clearPlayerRemovalTimer(roomCode, playerId);
+  }, PLAYER_REJOIN_GRACE_MS);
+};
+
+const clearRoomPlayerTimers = (roomCode) => {
+  const timers = playerRemovalTimers[roomCode];
+  if (!timers) return;
+
+  Object.values(timers).forEach((timerId) => clearTimeout(timerId));
+  delete playerRemovalTimers[roomCode];
+};
+
 const getPlayersList = (roomCode) => {
   const room = roomStatus[roomCode];
   const players = roomPlayers[roomCode];
   if (!players) return [];
 
   return Object.entries(players).map(([id, player]) => ({
-    socketId: id,
+    playerId: id,
+    socketId: player.socketId,
     name: player.name,
     score: player.score,
+    connected: !!player.connected,
     answeredCurrent:
       room?.phase === "question" &&
       player.answers?.[room.currentIndex] !== undefined,
@@ -103,11 +231,14 @@ const emitQuestionsUpdated = (roomCode) => {
   io.to(roomCode).emit("questions-updated", room.questions);
 };
 
-const buildSyncPayload = (roomCode) => {
+const buildSyncPayload = (roomCode, playerId = null) => {
   const room = roomStatus[roomCode];
   const question = room.questions[room.currentIndex];
   const elapsed = Math.floor((Date.now() - room.questionStartedAt) / 1000);
   const timeLeft = Math.max(0, room.questionTime - elapsed);
+  const playerAnswer = playerId
+    ? roomPlayers[roomCode]?.[playerId]?.answers?.[room.currentIndex]
+    : undefined;
 
   const payload = {
     currentIndex: room.currentIndex,
@@ -120,6 +251,10 @@ const buildSyncPayload = (roomCode) => {
       ? { question: question.question, options: question.options }
       : null,
   };
+
+  if (playerAnswer !== undefined) {
+    payload.playerAnswer = playerAnswer;
+  }
 
   if (room.phase === "reveal") {
     payload.correctAnswer = question.correct;
@@ -163,7 +298,7 @@ const finishQuiz = async (roomCode, endedEarly = false) => {
   activeQuizRoomCode = null;
 
   const leaderboard = getLeaderboardData(roomCode);
-  void saveLeaderboard(roomCode, leaderboard, room.questions.length);
+  await saveLeaderboard(roomCode, leaderboard, room.questions.length);
 
   io.to(roomCode).emit("quiz-ended", { leaderboard, endedEarly });
   io.to(room.hostSocketId).emit("quiz-finished", leaderboard);
@@ -233,19 +368,26 @@ const resetRoomQuiz = (roomCode) => {
     Object.entries(players).forEach(([id, player]) => {
       player.score = 0;
       player.answers = {};
+      if (player.connected) {
+        clearPlayerRemovalTimer(roomCode, id);
+      }
     });
   }
 };
 
 const saveLeaderboard = async (roomCode, leaderboardData, totalQuestions) => {
   try {
-    await Leaderboard.create({
+    const savedLeaderboard = await Leaderboard.create({
       roomCode,
       leaderboard: leaderboardData,
       totalQuestions,
     });
+
+    io.emit("admin-db-updated");
+    return savedLeaderboard;
   } catch (err) {
     console.warn("Leaderboard save skipped (offline mode):", err.message);
+    return null;
   }
 };
 
@@ -266,7 +408,7 @@ io.on("connection", (socket) => {
     });
   });
 
-  socket.on("create-room", () => {
+  socket.on("create-room", async () => {
     let roomCode = null;
 
     for (let attempt = 0; attempt < 10; attempt += 1) {
@@ -286,6 +428,8 @@ io.on("connection", (socket) => {
     socket.roomCode = roomCode;
     socket.isHost = true;
 
+    const persistedQuestions = await loadPersistedQuestions();
+
     roomStatus[roomCode] = {
       started: false,
       phase: "lobby",
@@ -293,10 +437,11 @@ io.on("connection", (socket) => {
       hostSocketId: socket.id,
       hostPlaying: false,
       questionTime: DEFAULT_QUESTION_TIME,
-      questions: cloneQuestions(defaultQuestions),
+      questions: [...cloneQuestions(defaultQuestions), ...cloneQuestions(persistedQuestions)],
     };
 
     roomPlayers[roomCode] = {};
+    playerRemovalTimers[roomCode] = {};
 
     console.log("Room created:", roomCode);
 
@@ -308,12 +453,18 @@ io.on("connection", (socket) => {
     emitPlayersList(roomCode);
   });
 
-  socket.on("join-room", ({ roomCode, name }) => {
+  socket.on("join-room", ({ roomCode, name, playerToken }) => {
     const code = normalizeRoomCode(roomCode);
     const trimmedName = name?.trim();
+    const playerId = String(playerToken || "").trim();
 
     if (!trimmedName) {
       socket.emit("join-error", "Enter your name to join.");
+      return;
+    }
+
+    if (!playerId) {
+      socket.emit("join-error", "Missing player session. Refresh the page and try again.");
       return;
     }
 
@@ -328,9 +479,10 @@ io.on("connection", (socket) => {
       return;
     }
 
-    const existingNames = Object.values(roomPlayers[code] || {}).map((p) =>
-      p.name.toLowerCase()
-    );
+    const roomPlayersList = Object.entries(roomPlayers[code] || {});
+    const existingNames = roomPlayersList
+      .filter(([id]) => id !== playerId)
+      .map(([, p]) => p.name.toLowerCase());
     if (existingNames.includes(trimmedName.toLowerCase())) {
       socket.emit("join-error", "That name is already taken in this room.");
       return;
@@ -338,26 +490,50 @@ io.on("connection", (socket) => {
 
     socket.join(code);
     socket.roomCode = code;
+    socket.playerId = playerId;
 
     if (!roomPlayers[code]) {
       roomPlayers[code] = {};
     }
 
-    roomPlayers[code][socket.id] = {
-      name: trimmedName,
-      score: 0,
-      answers: {},
-    };
+    const existingPlayer = roomPlayers[code][playerId];
 
-    const quizSync = room.started ? buildSyncPayload(code) : null;
+    if (existingPlayer) {
+      clearPlayerRemovalTimer(code, playerId);
+      existingPlayer.name = trimmedName;
+      existingPlayer.connected = true;
+      existingPlayer.socketId = socket.id;
+      delete existingPlayer.disconnectedAt;
+    } else {
+      roomPlayers[code][playerId] = {
+        name: trimmedName,
+        score: 0,
+        answers: {},
+        connected: true,
+        socketId: socket.id,
+      };
+    }
+
+    void saveParticipant({
+      roomCode: code,
+      playerToken: playerId,
+      name: trimmedName,
+      socket,
+      isHostPlayer: false,
+    });
+
+    const quizSync = room.started ? buildSyncPayload(code, playerId) : null;
 
     console.log(trimmedName, "joined room", code);
 
     socket.emit("join-success", {
       roomCode: code,
+      name: trimmedName,
       questions: room.questions,
       quizStarted: room.started,
       quizSync,
+      playerId,
+      resumed: !!existingPlayer,
     });
     io.to(code).emit("player-joined", trimmedName);
     emitPlayersList(code);
@@ -391,10 +567,21 @@ io.on("connection", (socket) => {
       name: trimmedName,
       score: 0,
       answers: {},
+      connected: true,
+      socketId: socket.id,
     };
+    socket.playerId = socket.id;
     room.hostPlaying = true;
 
-    const quizSync = room.started ? buildSyncPayload(code) : null;
+    void saveParticipant({
+      roomCode: code,
+      playerToken: socket.id,
+      name: trimmedName,
+      socket,
+      isHostPlayer: true,
+    });
+
+    const quizSync = room.started ? buildSyncPayload(code, socket.id) : null;
 
     socket.emit("host-join-success", {
       name: trimmedName,
@@ -417,12 +604,14 @@ io.on("connection", (socket) => {
     }
 
     delete roomPlayers[code]?.[socket.id];
+    clearPlayerRemovalTimer(code, socket.id);
+    void markParticipantDisconnected({ roomCode: code, playerToken: socket.id });
     room.hostPlaying = false;
     socket.emit("host-leave-success");
     emitPlayersList(code);
   });
 
-  socket.on("add-question", ({ roomCode, question }) => {
+  socket.on("add-question", async ({ roomCode, question }) => {
     if (!isHost(socket, roomCode)) {
       socket.emit("host-error", "Only the host can add questions.");
       return;
@@ -446,11 +635,27 @@ io.on("connection", (socket) => {
       return;
     }
 
-    room.questions.push({
-      question: question.question.trim(),
-      options: question.options.map((opt) => opt.trim()),
-      correct: question.correct,
+    const savedQuestion = await saveQuestionHistory({
+      roomCode,
+      question,
+      socket,
     });
+
+    room.questions.push(
+      savedQuestion
+        ? {
+            _id: String(savedQuestion._id),
+            question: savedQuestion.question,
+            options: [...savedQuestion.options],
+            correct: savedQuestion.correct,
+            addedAt: savedQuestion.addedAt,
+          }
+        : {
+            question: question.question.trim(),
+            options: question.options.map((opt) => opt.trim()),
+            correct: question.correct,
+          }
+    );
 
     emitQuestionsUpdated(roomCode);
   });
@@ -483,7 +688,7 @@ io.on("connection", (socket) => {
     socket.emit("question-time-updated", { questionTime: room.questionTime });
   });
 
-  socket.on("remove-question", ({ roomCode, index }) => {
+  socket.on("remove-question", async ({ roomCode, index }) => {
     if (!isHost(socket, roomCode)) {
       socket.emit("host-error", "Only the host can remove questions.");
       return;
@@ -505,39 +710,57 @@ io.on("connection", (socket) => {
       return;
     }
 
-    room.questions.splice(index, 1);
+    const [removedQuestion] = room.questions.splice(index, 1);
+
+    if (removedQuestion?._id) {
+      try {
+        await QuestionHistory.deleteOne({ _id: removedQuestion._id });
+        io.emit("admin-db-updated");
+      } catch (err) {
+        console.warn("Question delete skipped (offline mode):", err.message);
+      }
+    }
+
     emitQuestionsUpdated(roomCode);
   });
 
-  socket.on("kick-player", ({ roomCode, targetSocketId }) => {
+  socket.on("kick-player", ({ roomCode, targetPlayerId, targetSocketId }) => {
     if (!isHost(socket, roomCode)) {
       socket.emit("host-error", "Only the host can remove players.");
       return;
     }
 
     const room = roomStatus[roomCode];
-    if (targetSocketId === room?.hostSocketId) {
+    const playerId = targetPlayerId || targetSocketId;
+    if (playerId === room?.hostSocketId) {
       socket.emit("host-error", "Use 'Stop Playing' to leave the quiz yourself.");
       return;
     }
 
-    const player = roomPlayers[roomCode]?.[targetSocketId];
+    const player = roomPlayers[roomCode]?.[playerId];
     if (!player) {
       socket.emit("host-error", "Player not found.");
       return;
     }
 
-    io.to(targetSocketId).emit("kicked", {
-      message: "You were removed from the quiz by the host.",
-    });
+    clearPlayerRemovalTimer(roomCode, playerId);
 
-    delete roomPlayers[roomCode][targetSocketId];
+    if (player.socketId) {
+      io.to(player.socketId).emit("kicked", {
+        message: "You were removed from the quiz by the host.",
+      });
+    }
 
-    const targetSocket = io.sockets.sockets.get(targetSocketId);
+    delete roomPlayers[roomCode][playerId];
+
+    const targetSocket = player.socketId && io.sockets.sockets.get(player.socketId);
     if (targetSocket) {
       targetSocket.leave(roomCode);
       delete targetSocket.roomCode;
+      delete targetSocket.playerId;
     }
+
+    void markParticipantDisconnected({ roomCode, playerToken: playerId });
 
     emitPlayersList(roomCode);
     io.to(roomCode).emit("player-left", player.name);
@@ -567,12 +790,6 @@ io.on("connection", (socket) => {
 
     if (room.questions.length === 0) {
       socket.emit("host-error", "Add at least one question before starting.");
-      return;
-    }
-
-    const playerCount = Object.keys(roomPlayers[code] || {}).length;
-    if (playerCount === 0) {
-      socket.emit("host-error", "Wait for at least one player to join (or join as player).");
       return;
     }
 
@@ -658,7 +875,8 @@ io.on("connection", (socket) => {
   socket.on("submit-answer", ({ roomCode, answer }) => {
     const code = normalizeRoomCode(roomCode);
     const room = roomStatus[code];
-    const player = roomPlayers[code]?.[socket.id];
+    const playerId = socket.playerId || socket.id;
+    const player = roomPlayers[code]?.[playerId];
 
     if (!room || !player || room.phase !== "question") return;
 
@@ -677,7 +895,15 @@ io.on("connection", (socket) => {
     if (!roomCode) return;
 
     if (socket.isHost) {
+      if (socket.playerId) {
+        void markParticipantDisconnected({
+          roomCode,
+          playerToken: socket.playerId,
+        });
+      }
+
       clearRoomTimers(roomCode);
+      clearRoomPlayerTimers(roomCode);
       if (activeQuizRoomCode === roomCode) {
         activeQuizRoomCode = null;
       }
@@ -690,10 +916,21 @@ io.on("connection", (socket) => {
       return;
     }
 
-    const player = roomPlayers[roomCode]?.[socket.id];
+    const playerId = socket.playerId || socket.id;
+    const player = roomPlayers[roomCode]?.[playerId];
     if (player) {
-      delete roomPlayers[roomCode][socket.id];
-      io.to(roomCode).emit("player-left", player.name);
+      player.connected = false;
+      player.socketId = null;
+      player.disconnectedAt = Date.now();
+      void saveParticipant({
+        roomCode,
+        playerToken: playerId,
+        name: player.name,
+        socket,
+        isHostPlayer: !!socket.isHost,
+      });
+      schedulePlayerRemoval(roomCode, playerId);
+      io.to(roomCode).emit("player-disconnected", { playerId, name: player.name });
       emitPlayersList(roomCode);
     }
 
@@ -741,6 +978,96 @@ app.get("/api/admin/analytics", async (req, res) => {
       highestScore: 0,
       averageScore: 0,
       recentQuizzes: [],
+    });
+  }
+});
+
+app.get("/api/admin/participants", async (req, res) => {
+  try {
+    const roomCode = req.query.roomCode?.toString().trim();
+    const query = roomCode ? { roomCode } : {};
+
+    const participants = await QuizParticipant.find(query)
+      .sort({ lastSeenAt: -1, joinedAt: -1 })
+      .limit(200);
+
+    res.json(participants);
+  } catch (err) {
+    console.warn("Participant history unavailable:", err.message);
+    res.json([]);
+  }
+});
+
+app.get("/api/admin/questions", async (req, res) => {
+  try {
+    const roomCode = req.query.roomCode?.toString().trim();
+    const query = roomCode ? { roomCode } : {};
+
+    const questions = await QuestionHistory.find(query)
+      .sort({ addedAt: -1 })
+      .limit(200);
+
+    res.json(questions);
+  } catch (err) {
+    console.warn("Question history unavailable:", err.message);
+    res.json([]);
+  }
+});
+
+app.get("/api/admin/leaderboards", async (req, res) => {
+  try {
+    const roomCode = req.query.roomCode?.toString().trim();
+    const query = roomCode ? { roomCode } : {};
+
+    const leaderboards = await Leaderboard.find(query)
+      .sort({ playedAt: -1 })
+      .limit(200);
+
+    res.json(leaderboards);
+  } catch (err) {
+    console.warn("Leaderboard history unavailable:", err.message);
+    res.json([]);
+  }
+});
+
+app.get("/api/admin/db-collections", async (req, res) => {
+  try {
+    const  connectionState = mongoose?.connection?.readyState ?? 0;
+
+    if (connectionState !== 1) {
+      return res.json({
+        quiz_participants: 0,
+        quiz_question_history: 0,
+        quiz_leaderboards: 0,
+        database: mongoose?.connection?.name || null,
+        readyState: connectionState,
+        connected: false,
+      });
+    }
+
+    const collections = await Promise.all([
+      QuizParticipant.estimatedDocumentCount(),
+      QuestionHistory.estimatedDocumentCount(),
+      Leaderboard.estimatedDocumentCount(),
+    ]);
+
+    res.json({
+      quiz_participants: collections[0],
+      quiz_question_history: collections[1],
+      quiz_leaderboards: collections[2],
+      database: mongoose?.connection?.name || null,
+      readyState: connectionState,
+      connected: connectionState === 1,
+    });
+  } catch (err) {
+    console.warn("DB inspection unavailable:", err.message);
+    res.json({
+      quiz_participants: 0,
+      quiz_question_history: 0,
+      quiz_leaderboards: 0,
+      database: mongoose?.connection?.name || null,
+      readyState: mongoose?.connection?.readyState ?? 0,
+      connected: false,
     });
   }
 });

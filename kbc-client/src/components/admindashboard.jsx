@@ -1,8 +1,11 @@
 import { useEffect, useState } from "react";
+import socket from "../socket";
 import "../style/admindashboard.css";
 
 function AdminDashboard() {
   const [data, setData] = useState(null);
+  const [dbInfo, setDbInfo] = useState(null);
+  const [loadError, setLoadError] = useState("");
   const apiBaseUrl = process.env.REACT_APP_API_BASE_URL || "http://localhost:5000";
 
   useEffect(() => {
@@ -14,18 +17,65 @@ function AdminDashboard() {
   }, []);
 
   useEffect(() => {
-    fetch(`${apiBaseUrl}/api/admin/analytics`)
-      .then((res) => res.json())
-      .then(setData)
-      .catch(() =>
+    let cancelled = false;
+
+    const loadDashboard = async () => {
+      try {
+        const [analyticsResponse, dbResponse] = await Promise.all([
+          fetch(`${apiBaseUrl}/api/admin/analytics`),
+          fetch(`${apiBaseUrl}/api/admin/db-collections`),
+        ]);
+
+        const analyticsData = analyticsResponse.ok
+          ? await analyticsResponse.json()
+          : {
+              totalQuizzes: 0,
+              totalPlayers: 0,
+              highestScore: 0,
+              averageScore: 0,
+              recentQuizzes: [],
+            };
+
+        const databaseData = dbResponse.ok ? await dbResponse.json() : null;
+
+        if (cancelled) return;
+
+        setData(analyticsData);
+        setDbInfo(databaseData);
+        setLoadError(analyticsResponse.ok ? "" : "Analytics could not be loaded from the server.");
+      } catch {
+        if (cancelled) return;
+
         setData({
           totalQuizzes: 0,
           totalPlayers: 0,
           highestScore: 0,
           averageScore: 0,
           recentQuizzes: [],
-        })
-      );
+        });
+        setDbInfo(null);
+        setLoadError("Server is unavailable or MongoDB is not connected.");
+      }
+    };
+
+    const handleDbUpdate = () => {
+      void loadDashboard();
+    };
+
+    loadDashboard();
+    socket.on("admin-db-updated", handleDbUpdate);
+
+    const pollInterval = setInterval(() => {
+      if (socket.connected) {
+        void loadDashboard();
+      }
+    }, 10000);
+
+    return () => {
+      cancelled = true;
+      socket.off("admin-db-updated", handleDbUpdate);
+      clearInterval(pollInterval);
+    };
   }, [apiBaseUrl]);
 
   const handleLogout = () => {
@@ -54,10 +104,22 @@ function AdminDashboard() {
         <Stat title="Avg Score" value={data.averageScore} />
       </div>
 
+      {dbInfo && (
+        <p className="admin-muted">
+          Mongo status: {dbInfo.connected ? "connected" : "not connected"}. Saved records: {dbInfo.quiz_leaderboards || 0} quizzes, {dbInfo.quiz_question_history || 0} questions, {dbInfo.quiz_participants || 0} participants.
+        </p>
+      )}
+
+      {loadError && <p className="player-error">{loadError}</p>}
+
       <h2>Recent Quizzes</h2>
 
       {data.recentQuizzes.length === 0 ? (
-        <p>No quiz history yet (offline mode works without saving).</p>
+        <p>
+          {dbInfo?.connected
+            ? "No quiz history yet. Finish a quiz once and the leaderboard will appear here."
+            : "MongoDB is not connected, so quiz history cannot be saved yet."}
+        </p>
       ) : (
         <table className="dashboard-table" border="1" cellPadding="10">
           <thead>

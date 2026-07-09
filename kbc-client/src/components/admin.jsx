@@ -23,6 +23,7 @@ function Admin({ roomCode }) {
   const [joinName, setJoinName] = useState("Host");
   const [questionTime, setQuestionTime] = useState(15);
   const [hostInitialSync, setHostInitialSync] = useState(null);
+  const activeRoomCode = roomCode || socket.roomCode || "";
 
   useEffect(() => {
     const onRoomCreated = ({ questions: initialQuestions, questionTime: initialTime }) => {
@@ -150,48 +151,62 @@ function Admin({ roomCode }) {
 
   const handleAddQuestion = () => {
     setHostError("");
-    socket.emit("add-question", { roomCode, question: newQuestion });
+    if (!activeRoomCode) {
+      setHostError("Room is still being created. Try again in a moment.");
+      return;
+    }
+
+    setQuestions((currentQuestions) => [
+      ...currentQuestions,
+      {
+        question: newQuestion.question.trim(),
+        options: newQuestion.options.map((option) => option.trim()),
+        correct: newQuestion.correct,
+      },
+    ]);
+
+    socket.emit("add-question", { roomCode: activeRoomCode, question: newQuestion });
     setNewQuestion(emptyQuestion);
   };
 
   const handleRemoveQuestion = (index) => {
     setHostError("");
-    socket.emit("remove-question", { roomCode, index });
+    socket.emit("remove-question", { roomCode: activeRoomCode, index });
   };
 
-  const handleKickPlayer = (targetSocketId) => {
+  const handleKickPlayer = (targetPlayerId) => {
     setHostError("");
-    socket.emit("kick-player", { roomCode, targetSocketId });
+    socket.emit("kick-player", { roomCode: activeRoomCode, targetPlayerId });
   };
 
   const handleStartQuiz = () => {
     setHostError("");
-    socket.emit("start-quiz", roomCode);
+    socket.emit("start-quiz", activeRoomCode);
   };
 
   const handleEndQuiz = () => {
     setHostError("");
-    socket.emit("end-quiz", roomCode);
+    socket.emit("end-quiz", activeRoomCode);
   };
 
   const handleStartNewQuiz = () => {
     setHostError("");
-    socket.emit("start-new-quiz", roomCode);
+    socket.emit("start-new-quiz", activeRoomCode);
   };
 
   const handleJoinAsPlayer = () => {
     setHostError("");
-    socket.emit("host-join-as-player", { roomCode, name: joinName });
+    socket.emit("host-join-as-player", { roomCode: activeRoomCode, name: joinName });
   };
 
   const handleLeaveAsPlayer = () => {
     setHostError("");
-    socket.emit("host-leave-quiz", roomCode);
+    socket.emit("host-leave-quiz", activeRoomCode);
   };
 
   const handleApplyQuestionTime = () => {
     setHostError("");
-    socket.emit("set-question-time", { roomCode, questionTime });
+    socket.emit("set-question-time", { roomCode: activeRoomCode, questionTime });
   };
 
   const canEditQuestions = !quizLive && !quizFinished;
@@ -208,9 +223,9 @@ function Admin({ roomCode }) {
         <h2>Host Control Panel</h2>
         <p className="admin-subtitle">One quiz at a time. You can spectate or play.</p>
 
-        {roomCode ? (
+        {activeRoomCode ? (
           <p>
-            <strong>Room Code:</strong> <span className="admin-room-code">{roomCode}</span>
+            <strong>Room Code:</strong> <span className="admin-room-code">{activeRoomCode}</span>
           </p>
         ) : (
           <p>Creating room...</p>
@@ -284,18 +299,19 @@ function Admin({ roomCode }) {
           ) : (
             <ul className="admin-player-list">
               {players.map((player) => (
-                <li key={player.socketId}>
+                <li key={player.playerId || player.socketId}>
                   <span>
                     {player.name}
                     {player.name === hostPlayerName ? " (you)" : ""}
                     {quizLive || quizFinished ? ` - ${player.score} pts` : ""}
                     {quizLive && player.answeredCurrent ? " ✓" : ""}
+                    {!player.connected ? " · reconnecting" : ""}
                   </span>
                   {player.name !== hostPlayerName && (
                     <button
                       type="button"
                       className="admin-btn-danger"
-                      onClick={() => handleKickPlayer(player.socketId)}
+                      onClick={() => handleKickPlayer(player.playerId || player.socketId)}
                     >
                       Remove
                     </button>
@@ -376,7 +392,7 @@ function Admin({ roomCode }) {
           {!quizLive && !quizFinished && (
             <button
               type="button"
-              disabled={!roomCode || questions.length === 0 || (!hostPlaying && players.length === 0)}
+              disabled={!activeRoomCode || questions.length === 0}
               onClick={handleStartQuiz}
             >
               Start Quiz
@@ -390,7 +406,7 @@ function Admin({ roomCode }) {
           )}
 
           {quizFinished && (
-            <button type="button" disabled={!roomCode} onClick={handleStartNewQuiz}>
+            <button type="button" disabled={!activeRoomCode} onClick={handleStartNewQuiz}>
               Start New Quiz
             </button>
           )}

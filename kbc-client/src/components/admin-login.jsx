@@ -61,7 +61,7 @@ function AdminLogin({ onSuccess }) {
   return (
     <div className="landing-screen">
       <h2>Admin Login</h2>
-      <p className="join-hint">Default password: kbc_admin_123</p>
+      <p className="join-hint">Enter the admin password configured for this server.</p>
 
       <input
         type="password"

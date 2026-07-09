@@ -1,6 +1,8 @@
 const mongoose = require("mongoose");
 
-mongoose.connect("mongodb://127.0.0.1:27017/kbc-quiz").catch((err) => {
+const mongoUri = process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/kbc-quiz";
+
+mongoose.connect(mongoUri).catch((err) => {
   console.warn("MongoDB unavailable — running in offline mode:", err.message);
 });
 

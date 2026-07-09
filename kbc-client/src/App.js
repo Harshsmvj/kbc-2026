@@ -31,6 +31,7 @@ function App() {
     });
 
     socket.on("room-created", ({ roomCode: code }) => {
+      socket.roomCode = code;
       setRoomCode(code);
     });
 
