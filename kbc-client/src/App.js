@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import Admin from "./components/admin";
-import Quiz from "./components/quiz";
+//import Quiz from "./components/quiz";
 import Player from "./components/player";
 import socket from "./socket";
 import AdminDashboard from "./components/admindashboard";
