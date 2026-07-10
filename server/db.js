@@ -8,6 +8,8 @@ mongoose.connect(mongoUri).catch((err) => {
 
 mongoose.connection.once("open", () => {
   console.log("MongoDB connected");
+  console.log("Connected to:", mongoose.connection.host);
+  console.log("Database:", mongoose.connection.name);
 });
 
 mongoose.connection.on("error", (err) => {

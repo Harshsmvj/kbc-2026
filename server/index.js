@@ -1,4 +1,6 @@
+require("dotenv").config();
 const mongoose = require("./db");
+
 const Leaderboard = require("./leaderboard");
 const QuizParticipant = require("./participant");
 const QuestionHistory = require("./question-history");
